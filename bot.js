@@ -51,6 +51,9 @@ class ClerkKentBot {
       // Show typing indicator while searching
       await message.channel.sendTyping();
 
+      console.log(`[DEBUG] Raw message: "${message.content}"`);
+      console.log(`[DEBUG] Extracted judge name: "${judgeName}"`);
+
       const judges = await this.notion.searchJudge(judgeName);
 
       if (judges.length === 0) {
@@ -143,3 +146,4 @@ class ClerkKentBot {
 }
 
 module.exports = ClerkKentBot;
+ 

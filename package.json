@@ -6,6 +6,9 @@
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "@notionhq/client": "^2.2.15",
     "discord.js": "^14.16.3",
