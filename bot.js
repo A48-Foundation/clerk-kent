@@ -1,6 +1,6 @@
 const { Client, GatewayIntentBits, EmbedBuilder, Events } = require('discord.js');
 const NotionService = require('./notion-service');
-const PairingsPoller = require('./pairings-poller');
+const TournamentStore = require('./tournament-store');
 const TabroomScraper = require('./tabroom-scraper');
 
 class ClerkKentBot {
@@ -13,7 +13,7 @@ class ClerkKentBot {
       ],
     });
     this.notion = new NotionService();
-    this.poller = new PairingsPoller(this.client);
+    this.store = new TournamentStore();
     this.setupEventHandlers();
   }
 
@@ -21,7 +21,6 @@ class ClerkKentBot {
     this.client.once(Events.ClientReady, (readyClient) => {
       console.log(`✅ Clerk Kent is online as ${readyClient.user.tag}`);
       readyClient.user.setActivity('for @Clerk Kent [judge]', { type: 2 }); // "Listening to"
-      this.poller.start();
     });
 
     this.client.on(Events.MessageCreate, async (message) => {
@@ -65,8 +64,8 @@ class ClerkKentBot {
       return;
     }
 
-    if (lowerContent.startsWith('check ')) {
-      await this.handleCheck(message, content.slice(6).trim());
+    if (lowerContent.startsWith('report ')) {
+      await this.handleReport(message, content.slice(7).trim());
       return;
     }
 
@@ -113,12 +112,11 @@ class ClerkKentBot {
         return;
       }
 
-      const store = this.poller.getStore();
-      store.addTeam(tournId, teamCode, message.channel.id);
+      this.store.addTeam(tournId, teamCode, message.channel.id);
 
       await message.reply(
         `✅ Now tracking **${teamCode}** at tournament **${tournId}**.\n` +
-        `Pairings will be sent to this channel (<#${message.channel.id}>) when new rounds are posted.`
+        `Use \`@Clerk Kent report ${teamCode.split(' ').pop()}\` to get pairings & judge info.`
       );
     } catch (err) {
       console.error('Error in track command:', err);
@@ -132,15 +130,13 @@ class ClerkKentBot {
    */
   async handleUntrack(message, args) {
     const parts = args.split(/\s+/);
-    const store = this.poller.getStore();
 
     if (parts.length === 1) {
-      // Try to untrack from all tournaments
       const teamCode = parts[0];
-      const tournaments = store.getAllTournaments();
+      const tournaments = this.store.getAllTournaments();
       let removed = false;
       for (const tourn of tournaments) {
-        if (store.removeTeam(tourn.tournId, teamCode)) {
+        if (this.store.removeTeam(tourn.tournId, teamCode)) {
           removed = true;
         }
       }
@@ -152,7 +148,7 @@ class ClerkKentBot {
     } else {
       const tournId = parts[0];
       const teamCode = parts.slice(1).join(' ');
-      if (store.removeTeam(tournId, teamCode)) {
+      if (this.store.removeTeam(tournId, teamCode)) {
         await message.reply(`✅ Removed **${teamCode}** from tournament **${tournId}**.`);
       } else {
         await message.reply(`⚠️ **${teamCode}** is not being tracked for tournament **${tournId}**.`);
@@ -165,8 +161,7 @@ class ClerkKentBot {
    * Show all currently tracked tournaments and teams.
    */
   async handleStatus(message) {
-    const store = this.poller.getStore();
-    const tournaments = store.getAllTournaments();
+    const tournaments = this.store.getAllTournaments();
 
     if (tournaments.length === 0) {
       await message.reply('📭 No tournaments are currently being tracked.\n\nUse `@Clerk Kent track <tabroom_url> <team_code>` to start tracking.');
@@ -194,63 +189,152 @@ class ClerkKentBot {
   }
 
   /**
-   * Handle: @Clerk Kent check <tabroom_round_url>
-   * Manually check pairings for a specific round NOW (no waiting for poller).
+   * Handle: @Clerk Kent report <short_code>
+   * e.g. @Clerk Kent report SW
+   * Finds the tracked team whose code contains the short code,
+   * checks the latest round, and sends judge info to this channel.
    */
-  async handleCheck(message, url) {
+  async handleReport(message, shortCode) {
+    if (!shortCode) {
+      await message.reply('**Usage:** `@Clerk Kent report <team_code>`\n**Example:** `@Clerk Kent report SW`');
+      return;
+    }
+
     try {
       await message.channel.sendTyping();
 
-      let tournId, roundId;
+      // Find the tracked team matching the short code
+      const tournaments = this.store.getAllTournaments();
+      let matchedTeam = null;
+      let matchedTourn = null;
 
-      if (url.includes('round_id')) {
-        const parsed = TabroomScraper.parseRoundUrl(url);
-        tournId = parsed.tournId;
-        roundId = parsed.roundId;
-      } else {
-        await message.reply('⚠️ Please provide a round URL (must contain `round_id`).');
-        return;
+      for (const tourn of tournaments) {
+        const team = tourn.teams.find(t =>
+          t.code.toLowerCase().includes(shortCode.toLowerCase())
+        );
+        if (team) {
+          matchedTeam = team;
+          matchedTourn = tourn;
+          break;
+        }
       }
 
-      const pairings = await TabroomScraper.scrapePairings(tournId, roundId);
-      const roundTitle = await TabroomScraper.getRoundTitle(tournId, roundId);
-
-      if (pairings.length === 0) {
-        await message.reply('📭 No pairings found for that round yet.');
-        return;
-      }
-
-      // Check tracked teams for this tournament
-      const store = this.poller.getStore();
-      const tourn = store.getTournament(tournId);
-
-      if (!tourn || tourn.teams.length === 0) {
+      if (!matchedTeam) {
         await message.reply(
-          `Found **${pairings.length}** pairings for **${roundTitle}**, but no teams are tracked for this tournament.\n` +
-          `Use \`@Clerk Kent track <url> <team_code>\` first.`
+          `⚠️ No tracked team matches **"${shortCode}"**.\n` +
+          `Use \`@Clerk Kent track <tabroom_url> <team_code>\` to register a team first.`
         );
         return;
       }
 
-      let found = 0;
-      for (const team of tourn.teams) {
-        const pairing = TabroomScraper.findTeamPairing(pairings, team.code);
-        if (pairing) {
-          await this.poller.sendPairingInfo(team, pairing, roundTitle, tournId, roundId);
-          found++;
-        }
+      // Get all rounds and find the latest one
+      const rounds = await TabroomScraper.getRounds(matchedTourn.tournId);
+
+      if (rounds.length === 0) {
+        await message.reply('📭 No rounds found for this tournament yet.');
+        return;
       }
 
-      if (found === 0) {
-        await message.reply(`⚠️ None of the tracked teams were found in **${roundTitle}** pairings.`);
-      } else {
-        // Mark as seen so poller doesn't re-process
-        store.markRoundSeen(tournId, roundId);
+      // Use the last round in the list (most recent)
+      const latestRound = rounds[rounds.length - 1];
+
+      // Scrape pairings for the latest round
+      const pairings = await TabroomScraper.scrapePairings(matchedTourn.tournId, latestRound.roundId);
+      const roundTitle = await TabroomScraper.getRoundTitle(matchedTourn.tournId, latestRound.roundId);
+
+      if (pairings.length === 0) {
+        await message.reply(`📭 No pairings found for **${roundTitle}** yet.`);
+        return;
       }
+
+      // Find the team's pairing
+      const pairing = TabroomScraper.findTeamPairing(pairings, matchedTeam.code);
+
+      if (!pairing) {
+        await message.reply(`⚠️ **${matchedTeam.code}** not found in **${roundTitle}** pairings.`);
+        return;
+      }
+
+      // Build and send the pairing + judge embeds
+      await this.sendPairingReport(message.channel, matchedTeam, pairing, roundTitle, matchedTourn.tournId, latestRound.roundId);
     } catch (err) {
-      console.error('Error in check command:', err);
-      await message.reply('⚠️ Failed to check pairings. Make sure the URL is valid.');
+      console.error('Error in report command:', err);
+      await message.reply('⚠️ Something went wrong while fetching pairings. Try again later.');
     }
+  }
+
+  /**
+   * Send pairing + judge info embeds to a channel.
+   */
+  async sendPairingReport(channel, team, pairing, roundTitle, tournId, roundId) {
+    const summaryEmbed = new EmbedBuilder()
+      .setTitle(`📋 ${roundTitle}`)
+      .setColor(0xF5A623)
+      .setDescription(`**${team.code}** has been paired!`)
+      .addFields(
+        { name: 'Aff', value: pairing.aff || 'TBD', inline: true },
+        { name: 'Neg', value: pairing.neg || 'TBD', inline: true },
+        { name: 'Room', value: pairing.room || 'TBD', inline: true },
+      )
+      .setURL(`https://www.tabroom.com/index/tourn/postings/round.mhtml?tourn_id=${tournId}&round_id=${roundId}`)
+      .setTimestamp();
+
+    const embeds = [summaryEmbed];
+
+    for (const judge of pairing.judges) {
+      const judgeResults = await this.notion.searchJudge(judge.name);
+
+      if (judgeResults.length > 0) {
+        const j = judgeResults[0];
+        const judgeEmbed = new EmbedBuilder()
+          .setTitle(`⚖️ ${j.name}`)
+          .setColor(0x2F80ED);
+
+        judgeEmbed.addFields({ name: '📧 Email', value: j.email, inline: true });
+
+        if (j.tabroom) {
+          judgeEmbed.addFields({
+            name: '🔗 Tabroom',
+            value: `[View Profile](${j.tabroom})`,
+            inline: false,
+          });
+        }
+
+        if (j.comments.length > 0) {
+          const commentsText = j.comments
+            .map((c, i) => `**${i + 1}.** ${c}`)
+            .join('\n\n');
+          const truncated = commentsText.length > 1000
+            ? commentsText.slice(0, 997) + '...'
+            : commentsText;
+          judgeEmbed.addFields({
+            name: '📝 Notes',
+            value: truncated,
+            inline: false,
+          });
+        }
+
+        if (j.url) judgeEmbed.setURL(j.url);
+        embeds.push(judgeEmbed);
+      } else {
+        const unknownEmbed = new EmbedBuilder()
+          .setTitle(`⚖️ ${judge.name}`)
+          .setColor(0x95A5A6)
+          .setDescription('No notes found in the judge database.');
+
+        if (judge.judgeId) {
+          unknownEmbed.addFields({
+            name: '🔗 Tabroom',
+            value: `[View Profile](https://www.tabroom.com/index/tourn/postings/judge.mhtml?judge_id=${judge.judgeId}&tourn_id=${tournId})`,
+            inline: false,
+          });
+        }
+        embeds.push(unknownEmbed);
+      }
+    }
+
+    await channel.send({ embeds: embeds.slice(0, 10) });
+    console.log(`✅ Sent report for ${team.code} in ${roundTitle}`);
   }
 
   // ─── JUDGE LOOKUP ──────────────────────────────────────────────
@@ -337,14 +421,14 @@ class ClerkKentBot {
         '**Judge Lookup:**\n' +
         '`@Clerk Kent [Judge Name]` — Look up a judge\n\n' +
         '**Tournament Tracking:**\n' +
-        '`@Clerk Kent track <tabroom_url> <team_code>` — Track a team\'s pairings\n' +
+        '`@Clerk Kent track <tabroom_url> <team_code>` — Register a team to track\n' +
+        '`@Clerk Kent report <code>` — Get latest pairings & judge info for a team\n' +
         '`@Clerk Kent untrack <team_code>` — Stop tracking a team\n' +
-        '`@Clerk Kent check <round_url>` — Manually check a round now\n' +
         '`@Clerk Kent tournaments` — Show tracked tournaments\n\n' +
         '**Examples:**\n' +
-        '`@Clerk Kent Smith`\n' +
-        '`@Clerk Kent track https://www.tabroom.com/...?tourn_id=36452&round_id=123 Okemos AT`\n\n' +
-        'When pairings are released, I\'ll automatically send judge info to the channels you\'ve set up!'
+        '`@Clerk Kent Smith` — Judge lookup\n' +
+        '`@Clerk Kent track https://www.tabroom.com/...?tourn_id=36452&round_id=123 Interlake SW`\n' +
+        '`@Clerk Kent report SW` — Get judge info for Interlake SW\'s latest round'
       );
   }
 
