@@ -12,6 +12,7 @@
   "dependencies": {
     "@notionhq/client": "^2.2.15",
     "discord.js": "^14.16.3",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "fuse.js": "^7.1.0"
   }
 }

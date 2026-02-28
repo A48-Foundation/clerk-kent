@@ -1,51 +1,85 @@
 const { Client } = require('@notionhq/client');
+const Fuse = require('fuse.js');
+
+const CACHE_TTL_MS = 10 * 60 * 1000; // Refresh cache every 10 minutes
 
 class NotionService {
   constructor() {
     this.notion = new Client({ auth: process.env.NOTION_TOKEN });
     this.judgeDatabaseId = process.env.JUDGE_DATABASE_ID;
+
+    // Cache: array of { id, name } for all judges
+    this.judgeCache = [];
+    this.cacheTimestamp = 0;
+    this.fuse = null;
   }
 
   /**
-   * Search for judges by name (case-insensitive, partial match).
+   * Load all judge pages from Notion (handles pagination).
+   * Builds a Fuse.js index for fuzzy searching.
+   */
+  async refreshCache() {
+    const now = Date.now();
+    if (this.judgeCache.length > 0 && now - this.cacheTimestamp < CACHE_TTL_MS) {
+      return; // Cache is still fresh
+    }
+
+    console.log('🔄 Refreshing judge cache from Notion...');
+    const allPages = [];
+    let cursor = undefined;
+
+    do {
+      const response = await this.notion.databases.query({
+        database_id: this.judgeDatabaseId,
+        page_size: 100,
+        start_cursor: cursor,
+      });
+      allPages.push(...response.results);
+      cursor = response.has_more ? response.next_cursor : undefined;
+    } while (cursor);
+
+    this.judgeCache = allPages.map(page => ({
+      id: page.id,
+      name: page.properties['Name']?.title?.map(t => t.plain_text).join('') || 'Unknown',
+      page, // keep the full page for later data extraction
+    }));
+
+    this.fuse = new Fuse(this.judgeCache, {
+      keys: ['name'],
+      threshold: 0.4,      // 0 = exact, 1 = match anything; 0.4 is a good balance
+      distance: 100,
+      includeScore: true,
+    });
+
+    this.cacheTimestamp = now;
+    console.log(`✅ Cached ${this.judgeCache.length} judges`);
+  }
+
+  /**
+   * Search for judges by name with fuzzy matching.
    * Handles "Last, First" format by flipping to "First Last".
    * Returns an array of judge objects.
    */
   async searchJudge(name) {
+    await this.refreshCache();
+
     // If input is "Last, First" format, flip to "First Last"
     const normalizedName = name.includes(',')
       ? name.split(',').map(s => s.trim()).reverse().join(' ')
       : name;
 
-    // Search with the normalized name first
-    let response = await this.notion.databases.query({
-      database_id: this.judgeDatabaseId,
-      filter: {
-        property: 'Name',
-        title: {
-          contains: normalizedName,
-        },
-      },
-      page_size: 5,
-    });
+    // Fuzzy search against the cache
+    const results = this.fuse.search(normalizedName, { limit: 5 });
 
-    // If no results and we flipped the name, also try the original input
-    if (response.results.length === 0 && normalizedName !== name) {
-      response = await this.notion.databases.query({
-        database_id: this.judgeDatabaseId,
-        filter: {
-          property: 'Name',
-          title: {
-            contains: name,
-          },
-        },
-        page_size: 5,
-      });
+    // If no fuzzy results and we flipped the name, try original input too
+    if (results.length === 0 && normalizedName !== name) {
+      const fallback = this.fuse.search(name, { limit: 5 });
+      results.push(...fallback);
     }
 
     const judges = [];
-    for (const page of response.results) {
-      const judge = await this.extractJudgeData(page);
+    for (const result of results) {
+      const judge = await this.extractJudgeData(result.item.page);
       judges.push(judge);
     }
     return judges;
