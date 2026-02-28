@@ -8,19 +8,40 @@ class NotionService {
 
   /**
    * Search for judges by name (case-insensitive, partial match).
+   * Handles "Last, First" format by flipping to "First Last".
    * Returns an array of judge objects.
    */
   async searchJudge(name) {
-    const response = await this.notion.databases.query({
+    // If input is "Last, First" format, flip to "First Last"
+    const normalizedName = name.includes(',')
+      ? name.split(',').map(s => s.trim()).reverse().join(' ')
+      : name;
+
+    // Search with the normalized name first
+    let response = await this.notion.databases.query({
       database_id: this.judgeDatabaseId,
       filter: {
         property: 'Name',
         title: {
-          contains: name,
+          contains: normalizedName,
         },
       },
       page_size: 5,
     });
+
+    // If no results and we flipped the name, also try the original input
+    if (response.results.length === 0 && normalizedName !== name) {
+      response = await this.notion.databases.query({
+        database_id: this.judgeDatabaseId,
+        filter: {
+          property: 'Name',
+          title: {
+            contains: name,
+          },
+        },
+        page_size: 5,
+      });
+    }
 
     const judges = [];
     for (const page of response.results) {
