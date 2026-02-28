@@ -80,23 +80,8 @@ class ClerkKentBot {
       .setColor(0x2F80ED)
       .setTimestamp();
 
-    // Win Rate
-    embed.addFields({ name: '📊 Win Rate', value: judge.winRate, inline: true });
-
     // Email
     embed.addFields({ name: '📧 Email', value: judge.email, inline: true });
-
-    // Prefs
-    embed.addFields({ name: '⭐ Prefs', value: `${judge.prefs}`, inline: true });
-
-    // Tags
-    if (judge.tags.length > 0) {
-      embed.addFields({
-        name: '🏷️ Tags',
-        value: judge.tags.map(t => `\`${t}\``).join(', '),
-        inline: false,
-      });
-    }
 
     // Tabroom link
     if (judge.tabroom) {
