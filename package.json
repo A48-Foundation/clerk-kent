@@ -1,0 +1,14 @@
+{
+  "name": "clerk-kent",
+  "version": "1.0.0",
+  "description": "Discord bot that searches a Notion database for debate judge information",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.15",
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  }
+}
