@@ -1,6 +1,9 @@
 # Environment variables / secrets
 .env
 
+# Tournament tracking data
+tournaments.json
+
 # Dependencies
 node_modules/
 
