@@ -68,21 +68,18 @@ class NotionService {
       ? name.split(',').map(s => s.trim()).reverse().join(' ')
       : name;
 
-    // Fuzzy search against the cache
-    const results = this.fuse.search(normalizedName, { limit: 5 });
+    // Fuzzy search against the cache — return only the best match
+    let results = this.fuse.search(normalizedName, { limit: 1 });
 
     // If no fuzzy results and we flipped the name, try original input too
     if (results.length === 0 && normalizedName !== name) {
-      const fallback = this.fuse.search(name, { limit: 5 });
-      results.push(...fallback);
+      results = this.fuse.search(name, { limit: 1 });
     }
 
-    const judges = [];
-    for (const result of results) {
-      const judge = await this.extractJudgeData(result.item.page);
-      judges.push(judge);
-    }
-    return judges;
+    if (results.length === 0) return [];
+
+    const judge = await this.extractJudgeData(results[0].item.page);
+    return [judge];
   }
 
   /**
