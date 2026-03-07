@@ -2,6 +2,13 @@ const { Client, GatewayIntentBits, EmbedBuilder, Events } = require('discord.js'
 const NotionService = require('./notion-service');
 const TournamentStore = require('./tournament-store');
 const TabroomScraper = require('./tabroom-scraper');
+const EmailMonitor = require('./email-monitor');
+const EmailParser = require('./email-parser');
+const ChannelMapper = require('./channel-mapper');
+const CaselistService = require('./caselist-service');
+const ParadigmService = require('./paradigm-service');
+const LlmService = require('./llm-service');
+const ReportBuilder = require('./report-builder');
 
 class ClerkKentBot {
   constructor() {
@@ -14,6 +21,12 @@ class ClerkKentBot {
     });
     this.notion = new NotionService();
     this.store = new TournamentStore();
+    this.emailMonitor = null;
+    this.channelMapper = null; // initialized after client is ready
+    this.caselistService = new CaselistService();
+    this.paradigmService = new ParadigmService();
+    this.llmService = new LlmService();
+    this.reportBuilder = new ReportBuilder();
     this.setupEventHandlers();
   }
 
@@ -21,6 +34,7 @@ class ClerkKentBot {
     this.client.once(Events.ClientReady, (readyClient) => {
       console.log(`✅ Clerk Kent is online as ${readyClient.user.tag}`);
       readyClient.user.setActivity('for @Clerk Kent [judge]', { type: 2 }); // "Listening to"
+      this.channelMapper = new ChannelMapper(this.client);
     });
 
     this.client.on(Events.MessageCreate, async (message) => {
@@ -49,6 +63,16 @@ class ClerkKentBot {
     // Check for tournament management commands
     const lowerContent = content.toLowerCase();
 
+    if (lowerContent.startsWith('initiate pairings reports ')) {
+      await this.handleInitiatePairings(message, content.slice('initiate pairings reports '.length).trim());
+      return;
+    }
+
+    if (lowerContent === 'stop pairings') {
+      await this.handleStopPairings(message);
+      return;
+    }
+
     if (lowerContent.startsWith('track ')) {
       await this.handleTrack(message, content.slice(6).trim());
       return;
@@ -71,6 +95,264 @@ class ClerkKentBot {
 
     // Default: judge lookup
     await this.handleJudgeLookup(message, content);
+  }
+
+  // ─── PAIRINGS PIPELINE COMMANDS ─────────────────────────────────
+
+  /**
+   * Handle: @Clerk Kent initiate pairings reports <tabroom_url>
+   * Scrapes initial pairings, maps teams to channels, starts email monitor.
+   */
+  async handleInitiatePairings(message, url) {
+    if (!url) {
+      await message.reply(
+        '**Usage:** `@Clerk Kent initiate pairings reports <tabroom_pairings_url>`\n' +
+        '**Example:** `@Clerk Kent initiate pairings reports https://www.tabroom.com/index/tourn/postings/round.mhtml?tourn_id=36452&round_id=1503711`'
+      );
+      return;
+    }
+
+    try {
+      await message.channel.sendTyping();
+
+      // Parse tournament ID from URL
+      let tournId, roundId;
+      if (url.includes('round_id')) {
+        const parsed = TabroomScraper.parseRoundUrl(url);
+        tournId = parsed.tournId;
+        roundId = parsed.roundId;
+      } else {
+        const parsed = new URL(url);
+        tournId = parsed.searchParams.get('tourn_id');
+      }
+
+      if (!tournId) {
+        await message.reply('⚠️ Could not extract tournament ID from that URL. Make sure it\'s a valid Tabroom URL.');
+        return;
+      }
+
+      // Scrape current pairings
+      if (!roundId) {
+        const rounds = await TabroomScraper.getRounds(tournId);
+        if (rounds.length === 0) {
+          await message.reply('⚠️ No rounds found for this tournament.');
+          return;
+        }
+        roundId = rounds[rounds.length - 1].roundId;
+      }
+
+      const pairings = await TabroomScraper.scrapePairings(tournId, roundId);
+      if (pairings.length === 0) {
+        await message.reply('⚠️ No pairings found for this round yet.');
+        return;
+      }
+
+      // Filter for our school's teams
+      const schoolNames = (process.env.SCHOOL_NAMES || 'Interlake,Cuttlefish')
+        .split(',')
+        .map(s => s.trim().toLowerCase());
+
+      const ourTeamCodes = [];
+      for (const p of pairings) {
+        for (const code of [p.aff, p.neg]) {
+          if (code && schoolNames.some(s => code.toLowerCase().startsWith(s))) {
+            ourTeamCodes.push(code);
+          }
+        }
+      }
+
+      if (ourTeamCodes.length === 0) {
+        await message.reply(`⚠️ No teams matching school names (${schoolNames.join(', ')}) found in pairings.`);
+        return;
+      }
+
+      // Auto-map teams to Discord channels and confirm
+      const mapping = await this.channelMapper.autoMap(ourTeamCodes);
+      const confirmed = await this.channelMapper.confirmMapping(message.channel, mapping);
+
+      // Build channelMappings as { teamCode: channelId }
+      const channelMappings = {};
+      for (const [team, info] of Object.entries(confirmed)) {
+        if (info.channelId) {
+          channelMappings[team] = info.channelId;
+        }
+      }
+
+      // Store the active session
+      this.store.setActiveSession(tournId, url, channelMappings);
+
+      // Start email monitor
+      if (this.emailMonitor) {
+        this.emailMonitor.stop();
+      }
+
+      this.emailMonitor = new EmailMonitor({
+        email: process.env.IMAP_EMAIL,
+        password: process.env.IMAP_PASSWORD,
+      });
+
+      this.emailMonitor.on('pairing', (eventData) => this.handlePairingEvent(eventData));
+      this.emailMonitor.on('error', (err) => console.error('[EmailMonitor] Error:', err.message));
+      this.emailMonitor.start();
+
+      const teamList = Object.entries(channelMappings)
+        .map(([team, chId]) => `• **${team}** → <#${chId}>`)
+        .join('\n');
+
+      await message.reply(
+        `✅ **Pairings pipeline activated** for tournament **${tournId}**!\n\n` +
+        `${teamList}\n\n` +
+        `📧 Email monitor started — pairing reports will be sent automatically.\n` +
+        `Use \`@Clerk Kent stop pairings\` to stop.`
+      );
+    } catch (err) {
+      console.error('Error in initiate pairings command:', err);
+      await message.reply('⚠️ Something went wrong while setting up pairings. Check the URL and try again.');
+    }
+  }
+
+  /**
+   * Handle: @Clerk Kent stop pairings
+   * Stops the email monitor and clears the active session.
+   */
+  async handleStopPairings(message) {
+    if (this.emailMonitor) {
+      this.emailMonitor.stop();
+      this.emailMonitor = null;
+    }
+    this.store.clearActiveSession();
+    await message.reply('✅ Pairings pipeline stopped. Email monitor deactivated and session cleared.');
+  }
+
+  /**
+   * Handle an incoming pairing event from the EmailMonitor.
+   * Looks up opponent caselist, judge paradigms, and sends a full report.
+   */
+  async handlePairingEvent(eventData) {
+    try {
+      const { parsed, uid } = eventData;
+      if (!parsed) return;
+
+      const session = this.store.getActiveSession();
+      if (!session) return;
+
+      // Check if already processed
+      if (this.store.isEmailProcessed(uid)) return;
+      this.store.addProcessedEmailUid(uid);
+
+      const schoolNames = (process.env.SCHOOL_NAMES || 'Interlake,Cuttlefish')
+        .split(',')
+        .map(s => s.trim().toLowerCase());
+
+      // Determine which side is ours and which is the opponent
+      const affCode = parsed.aff?.teamCode || '';
+      const negCode = parsed.neg?.teamCode || '';
+      const affIsOurs = schoolNames.some(s => affCode.toLowerCase().startsWith(s));
+      const negIsOurs = schoolNames.some(s => negCode.toLowerCase().startsWith(s));
+
+      let ourTeamCode, opponentCode, opponentSide;
+      if (affIsOurs) {
+        ourTeamCode = affCode;
+        opponentCode = negCode;
+        opponentSide = 'N';
+      } else if (negIsOurs) {
+        ourTeamCode = negCode;
+        opponentCode = affCode;
+        opponentSide = 'A';
+      } else {
+        // Neither team is ours — skip
+        return;
+      }
+
+      // Find the channel for our team
+      const channelId = session.channelMappings[ourTeamCode];
+      if (!channelId) return;
+
+      const channel = await this.client.channels.fetch(channelId);
+      if (!channel) return;
+
+      await channel.sendTyping();
+
+      // Look up opponent on caselist
+      let opponentData = null;
+      let argumentSummary = '_No caselist data found._';
+      if (opponentCode) {
+        const caselistResult = await this.caselistService.lookupOpponent(opponentCode, opponentSide);
+        if (caselistResult && caselistResult.rounds.length > 0) {
+          argumentSummary = await this.llmService.summarizeWithFallback(caselistResult.rounds, opponentSide);
+          opponentData = {
+            schoolName: caselistResult.schoolName,
+            teamCode: caselistResult.teamCode,
+            caselistUrl: caselistResult.caselistUrl,
+            side: opponentSide === 'A' ? 'Aff' : 'Neg',
+            argumentSummary,
+          };
+        } else {
+          opponentData = {
+            schoolName: opponentCode,
+            teamCode: '',
+            caselistUrl: null,
+            side: opponentSide === 'A' ? 'Aff' : 'Neg',
+            argumentSummary,
+          };
+        }
+      }
+
+      // Look up judges
+      const judgeEmbedData = [];
+      for (const judge of (parsed.judges || [])) {
+        const judgeName = judge.name;
+        let paradigmSummary = null;
+        let paradigmUrl = null;
+        let school = null;
+
+        // Fetch paradigm from Tabroom
+        const paradigm = await this.paradigmService.fetchParadigmByName(judgeName);
+        if (paradigm) {
+          paradigmUrl = paradigm.paradigmUrl;
+          school = paradigm.school;
+          if (paradigm.philosophy) {
+            paradigmSummary = await this.llmService.summarizeParadigm(paradigm.philosophy);
+          }
+        }
+
+        // Look up in Notion
+        let notionNotes = null;
+        let notionUrl = null;
+        const notionResults = await this.notion.searchJudge(judgeName);
+        if (notionResults.length > 0) {
+          const j = notionResults[0];
+          notionUrl = j.url || null;
+          if (j.comments && j.comments.length > 0) {
+            notionNotes = j.comments.map((c, i) => `**${i + 1}.** ${c}`).join('\n');
+            if (notionNotes.length > 500) notionNotes = notionNotes.slice(0, 497) + '...';
+          }
+        }
+
+        judgeEmbedData.push({
+          name: judgeName,
+          paradigmSummary,
+          paradigmUrl,
+          school,
+          notionNotes,
+          notionUrl,
+        });
+      }
+
+      // Build and send the full report
+      const embeds = this.reportBuilder.buildFullReport(
+        { ...parsed, teamCode: ourTeamCode },
+        opponentData,
+        judgeEmbedData
+      );
+
+      if (embeds.length > 0) {
+        await channel.send({ embeds: embeds.slice(0, 10) });
+        console.log(`✅ Sent pairings report for ${ourTeamCode} (Round ${parsed.roundNumber || '?'})`);
+      }
+    } catch (err) {
+      console.error('[handlePairingEvent] Error:', err);
+    }
   }
 
   // ─── TOURNAMENT TRACKING COMMANDS ──────────────────────────────
@@ -425,10 +707,14 @@ class ClerkKentBot {
         '`@Clerk Kent report <code>` — Get latest pairings & judge info for a team\n' +
         '`@Clerk Kent untrack <team_code>` — Stop tracking a team\n' +
         '`@Clerk Kent tournaments` — Show tracked tournaments\n\n' +
+        '**Automated Pairings Pipeline:**\n' +
+        '`@Clerk Kent initiate pairings reports <tabroom_url>` — Start auto reports via email\n' +
+        '`@Clerk Kent stop pairings` — Stop the automated pipeline\n\n' +
         '**Examples:**\n' +
         '`@Clerk Kent Smith` — Judge lookup\n' +
         '`@Clerk Kent track https://www.tabroom.com/...?tourn_id=36452&round_id=123 Interlake SW`\n' +
-        '`@Clerk Kent report SW` — Get judge info for Interlake SW\'s latest round'
+        '`@Clerk Kent report SW` — Get judge info for Interlake SW\'s latest round\n' +
+        '`@Clerk Kent initiate pairings reports https://www.tabroom.com/...?tourn_id=36452&round_id=123`'
       );
   }
 
