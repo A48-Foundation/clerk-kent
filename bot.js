@@ -226,7 +226,8 @@ class ClerkKentBot {
 
   /**
    * Handle an incoming pairing event from the EmailMonitor.
-   * Looks up opponent caselist, judge paradigms, and sends a full report.
+   * Supports both Format A (liveUpdate) and Format B (assignments).
+   * Routes each team's pairing to _processSinglePairing().
    */
   async handlePairingEvent(eventData) {
     try {
@@ -244,114 +245,165 @@ class ClerkKentBot {
         .split(',')
         .map(s => s.trim().toLowerCase());
 
-      // Determine which side is ours and which is the opponent
-      const affCode = parsed.aff?.teamCode || '';
-      const negCode = parsed.neg?.teamCode || '';
-      const affIsOurs = schoolNames.some(s => affCode.toLowerCase().startsWith(s));
-      const negIsOurs = schoolNames.some(s => negCode.toLowerCase().startsWith(s));
+      if (parsed.format === 'assignments') {
+        // Format B: process each entry in the assignments email
+        for (const entry of (parsed.entries || [])) {
+          const isOurs = schoolNames.some(s => entry.teamCode.toLowerCase().startsWith(s));
+          if (!isOurs) continue;
 
-      let ourTeamCode, opponentCode, opponentSide;
-      if (affIsOurs) {
-        ourTeamCode = affCode;
-        opponentCode = negCode;
-        opponentSide = 'N';
-      } else if (negIsOurs) {
-        ourTeamCode = negCode;
-        opponentCode = affCode;
-        opponentSide = 'A';
+          // For FLIP, side is unknown; for AFF/NEG it's set
+          let opponentSide = null;
+          if (entry.side === 'AFF') opponentSide = 'N';
+          else if (entry.side === 'NEG') opponentSide = 'A';
+          // FLIP = unknown, we'll skip caselist side filtering
+
+          await this._processSinglePairing({
+            ourTeamCode: entry.teamCode,
+            opponentCode: entry.opponent,
+            opponentSide,
+            side: entry.side,
+            room: entry.room,
+            judges: entry.judges || [],
+            roundTitle: parsed.roundTitle,
+            startTime: parsed.startTime,
+            roundNumber: null,
+          }, session);
+        }
       } else {
-        // Neither team is ours — skip
-        return;
-      }
+        // Format A: single live update pairing
+        const affCode = parsed.aff?.teamCode || '';
+        const negCode = parsed.neg?.teamCode || '';
+        const affIsOurs = schoolNames.some(s => affCode.toLowerCase().startsWith(s));
+        const negIsOurs = schoolNames.some(s => negCode.toLowerCase().startsWith(s));
 
-      // Find the channel for our team
-      const channelId = session.channelMappings[ourTeamCode];
-      if (!channelId) return;
-
-      const channel = await this.client.channels.fetch(channelId);
-      if (!channel) return;
-
-      await channel.sendTyping();
-
-      // Look up opponent on caselist
-      let opponentData = null;
-      let argumentSummary = '_No caselist data found._';
-      if (opponentCode) {
-        const caselistResult = await this.caselistService.lookupOpponent(opponentCode, opponentSide);
-        if (caselistResult && caselistResult.rounds.length > 0) {
-          argumentSummary = await this.llmService.summarizeWithFallback(caselistResult.rounds, opponentSide);
-          opponentData = {
-            schoolName: caselistResult.schoolName,
-            teamCode: caselistResult.teamCode,
-            caselistUrl: caselistResult.caselistUrl,
-            side: opponentSide === 'A' ? 'Aff' : 'Neg',
-            argumentSummary,
-          };
+        let ourTeamCode, opponentCode, opponentSide, side;
+        if (affIsOurs) {
+          ourTeamCode = affCode;
+          opponentCode = negCode;
+          opponentSide = 'N';
+          side = 'AFF';
+        } else if (negIsOurs) {
+          ourTeamCode = negCode;
+          opponentCode = affCode;
+          opponentSide = 'A';
+          side = 'NEG';
         } else {
-          opponentData = {
-            schoolName: opponentCode,
-            teamCode: '',
-            caselistUrl: null,
-            side: opponentSide === 'A' ? 'Aff' : 'Neg',
-            argumentSummary,
-          };
-        }
-      }
-
-      // Look up judges
-      const judgeEmbedData = [];
-      for (const judge of (parsed.judges || [])) {
-        const judgeName = judge.name;
-        let paradigmSummary = null;
-        let paradigmUrl = null;
-        let school = null;
-
-        // Fetch paradigm from Tabroom
-        const paradigm = await this.paradigmService.fetchParadigmByName(judgeName);
-        if (paradigm) {
-          paradigmUrl = paradigm.paradigmUrl;
-          school = paradigm.school;
-          if (paradigm.philosophy) {
-            paradigmSummary = await this.llmService.summarizeParadigm(paradigm.philosophy);
-          }
+          return;
         }
 
-        // Look up in Notion
-        let notionNotes = null;
-        let notionUrl = null;
-        const notionResults = await this.notion.searchJudge(judgeName);
-        if (notionResults.length > 0) {
-          const j = notionResults[0];
-          notionUrl = j.url || null;
-          if (j.comments && j.comments.length > 0) {
-            notionNotes = j.comments.map((c, i) => `**${i + 1}.** ${c}`).join('\n');
-            if (notionNotes.length > 500) notionNotes = notionNotes.slice(0, 497) + '...';
-          }
-        }
-
-        judgeEmbedData.push({
-          name: judgeName,
-          paradigmSummary,
-          paradigmUrl,
-          school,
-          notionNotes,
-          notionUrl,
-        });
-      }
-
-      // Build and send the full report
-      const embeds = this.reportBuilder.buildFullReport(
-        { ...parsed, teamCode: ourTeamCode },
-        opponentData,
-        judgeEmbedData
-      );
-
-      if (embeds.length > 0) {
-        await channel.send({ embeds: embeds.slice(0, 10) });
-        console.log(`✅ Sent pairings report for ${ourTeamCode} (Round ${parsed.roundNumber || '?'})`);
+        await this._processSinglePairing({
+          ourTeamCode,
+          opponentCode,
+          opponentSide,
+          side,
+          room: parsed.room,
+          judges: parsed.judges || [],
+          roundTitle: parsed.roundTitle,
+          startTime: parsed.startTime,
+          roundNumber: parsed.roundNumber,
+          aff: parsed.aff,
+          neg: parsed.neg,
+        }, session);
       }
     } catch (err) {
       console.error('[handlePairingEvent] Error:', err);
+    }
+  }
+
+  /**
+   * Process a single team's pairing: look up opponent, judges, send report.
+   */
+  async _processSinglePairing(pairing, session) {
+    const { ourTeamCode, opponentCode, opponentSide, side, room, judges,
+            roundTitle, startTime, roundNumber, aff, neg } = pairing;
+
+    // Find the channel for our team
+    const channelId = session.channelMappings[ourTeamCode];
+    if (!channelId) {
+      console.warn(`[Pairing] No channel mapped for ${ourTeamCode}`);
+      return;
+    }
+
+    const channel = await this.client.channels.fetch(channelId);
+    if (!channel) return;
+
+    await channel.sendTyping();
+
+    // Look up opponent on caselist
+    let opponentData = null;
+    let argumentSummary = '_No caselist data found._';
+    if (opponentCode) {
+      const caselistResult = opponentSide
+        ? await this.caselistService.lookupOpponent(opponentCode, opponentSide)
+        : null;
+      if (caselistResult && caselistResult.rounds.length > 0) {
+        argumentSummary = await this.llmService.summarizeWithFallback(caselistResult.rounds, opponentSide);
+        opponentData = {
+          schoolName: caselistResult.schoolName,
+          teamCode: caselistResult.teamCode,
+          caselistUrl: caselistResult.caselistUrl,
+          side: opponentSide === 'A' ? 'Aff' : 'Neg',
+          argumentSummary,
+        };
+      } else {
+        opponentData = {
+          schoolName: opponentCode,
+          teamCode: '',
+          caselistUrl: null,
+          side: opponentSide ? (opponentSide === 'A' ? 'Aff' : 'Neg') : 'FLIP',
+          argumentSummary: opponentSide ? argumentSummary : '_Side unknown (FLIP) — caselist lookup skipped._',
+        };
+      }
+    }
+
+    // Look up judges
+    const judgeEmbedData = [];
+    for (const judge of judges) {
+      const judgeName = judge.name;
+      let paradigmSummary = null;
+      let paradigmUrl = null;
+      let school = null;
+
+      const paradigm = await this.paradigmService.fetchParadigmByName(judgeName);
+      if (paradigm) {
+        paradigmUrl = paradigm.paradigmUrl;
+        school = paradigm.school;
+        if (paradigm.philosophy) {
+          paradigmSummary = await this.llmService.summarizeParadigm(paradigm.philosophy);
+        }
+      }
+
+      let notionNotes = null;
+      let notionUrl = null;
+      const notionResults = await this.notion.searchJudge(judgeName);
+      if (notionResults.length > 0) {
+        const j = notionResults[0];
+        notionUrl = j.url || null;
+        if (j.comments && j.comments.length > 0) {
+          notionNotes = j.comments.map((c, i) => `**${i + 1}.** ${c}`).join('\n');
+          if (notionNotes.length > 500) notionNotes = notionNotes.slice(0, 497) + '...';
+        }
+      }
+
+      judgeEmbedData.push({ name: judgeName, paradigmSummary, paradigmUrl, school, notionNotes, notionUrl });
+    }
+
+    // Build pairing data for the embed
+    const pairingEmbed = {
+      roundTitle: roundTitle || `Round ${roundNumber || '?'}`,
+      startTime,
+      room,
+      side,
+      teamCode: ourTeamCode,
+      aff: aff || { teamCode: side === 'AFF' ? ourTeamCode : opponentCode },
+      neg: neg || { teamCode: side === 'NEG' ? ourTeamCode : opponentCode },
+    };
+
+    const embeds = this.reportBuilder.buildFullReport(pairingEmbed, opponentData, judgeEmbedData);
+
+    if (embeds.length > 0) {
+      await channel.send({ embeds: embeds.slice(0, 10) });
+      console.log(`✅ Sent pairings report for ${ourTeamCode} (${roundTitle || 'Round ' + (roundNumber || '?')})`);
     }
   }
 

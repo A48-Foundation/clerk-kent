@@ -8,12 +8,12 @@ class EmailMonitor extends EventEmitter {
     super();
     this.email = options.email || process.env.IMAP_EMAIL;
     this.password = options.password || process.env.IMAP_PASSWORD;
-    this.pollInterval = options.pollInterval || 30000;
-    this._pollTimer = null;
     this._imap = null;
+    this._stopped = false;
   }
 
   start() {
+    this._stopped = false;
     this._imap = new Imap({
       user: this.email,
       password: this.password,
@@ -25,7 +25,7 @@ class EmailMonitor extends EventEmitter {
 
     this._imap.once('ready', () => {
       this.emit('connected');
-      this._startPolling();
+      this._openInbox();
     });
 
     this._imap.once('error', (err) => {
@@ -40,28 +40,36 @@ class EmailMonitor extends EventEmitter {
   }
 
   stop() {
-    if (this._pollTimer) {
-      clearTimeout(this._pollTimer);
-      this._pollTimer = null;
-    }
+    this._stopped = true;
     if (this._imap) {
       this._imap.end();
       this._imap = null;
     }
   }
 
-  _startPolling() {
-    const runPoll = async () => {
+  _openInbox() {
+    this._imap.openBox('INBOX', false, async (err) => {
+      if (err) {
+        this.emit('error', err);
+        return;
+      }
+
+      // Check for any unseen messages on startup
       try {
         await this.poll();
-      } catch (err) {
-        this.emit('error', err);
+      } catch (pollErr) {
+        this.emit('error', pollErr);
       }
-      if (this._imap) {
-        this._pollTimer = setTimeout(runPoll, this.pollInterval);
-      }
-    };
-    runPoll();
+
+      // Listen for new mail via IDLE push
+      this._imap.on('mail', async () => {
+        try {
+          await this.poll();
+        } catch (pollErr) {
+          this.emit('error', pollErr);
+        }
+      });
+    });
   }
 
   async poll() {
@@ -77,7 +85,7 @@ class EmailMonitor extends EventEmitter {
           body: parsed.text || ''
         };
 
-        if (!EmailParser.isTabroomEmail(emailData)) {
+        if (!EmailParser.isPairingEmail(emailData)) {
           continue;
         }
 
@@ -92,13 +100,10 @@ class EmailMonitor extends EventEmitter {
 
   _search() {
     return new Promise((resolve, reject) => {
-      this._imap.openBox('INBOX', false, (err) => {
+      const criteria = ['UNSEEN', ['FROM', '@www.tabroom.com']];
+      this._imap.search(criteria, (err, results) => {
         if (err) return reject(err);
-        const criteria = ['UNSEEN', ['FROM', '@www.tabroom.com']];
-        this._imap.search(criteria, (err, results) => {
-          if (err) return reject(err);
-          resolve(results || []);
-        });
+        resolve(results || []);
       });
     });
   }
